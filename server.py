@@ -22,13 +22,20 @@ import codex_usage
 import forecast
 import store as store_mod
 import usage_api
+import errors
+import updates
+import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIST = os.path.join(HERE, "web", "dist")  # build do frontend React/Konsta
 
-WINDOW_HOURS = {"five_hour": 5, "seven_day": 168, "seven_day_sonnet": 168}
-WINDOW_LABELS = {"five_hour": "Sessao (5h)", "seven_day": "Semana (7d)",
-                 "seven_day_sonnet": "Sonnet (7d)"}
+LEGACY_WINDOW_KEYS = usage_api.LEGACY_WINDOW_KEYS
+WINDOW_LABELS = usage_api.WINDOW_LABELS
+# Rotulos das cotas do Claude em quotas[] (mesmo padrao "produto · janela"
+# das do Codex). Janelas por modelo usam o nome que o servidor manda.
+QUOTA_LABELS = {"five_hour": "Sessão · 5 horas", "seven_day": "Semana · 7 dias",
+                "seven_day_sonnet": "Sonnet · 7 dias", "seven_day_opus": "Opus · 7 dias"}
+_CODEX_SHORT = re.compile(r"^gpt-[\d.]+-codex-(.+)$", re.IGNORECASE)
 
 
 class Ctx:
@@ -36,7 +43,8 @@ class Ctx:
     codex = None
     cfg = None
     token_store = None
-    last_error = None
+    last_error = None         # frase pra UI (errors.humanize)
+    last_error_detail = None  # 'Tipo: mensagem original', so' pra depuracao
     last_poll = None
     auth_connected = False
     _login_thread = None
@@ -48,6 +56,7 @@ class Ctx:
     rate_limit_hits = 0    # 429s seguidos — alimenta o backoff exponencial
     next_poll_at = 0.0     # timestamp do proximo poll permitido
     boot_retries = 0       # falhas antes da PRIMEIRA leitura boa (pos-boot)
+    ignored_logged = False # ja avisou (uma vez por boot) o que a API manda e nao vira cota
 
 
 # Ritmo do poll da API de uso. NAO e configuravel de proposito: o limite de
@@ -90,30 +99,174 @@ def refresh_fx(log=print):
 
 # --- montagem do estado ------------------------------------------------------
 
+def fx_rate():
+    """Cotacao USD->BRL em vigor: fixa no config.json (`usd_brl`) ou a
+    automatica. UNICO ponto de conversao do backend — o resto so' consome."""
+    return Ctx.cfg.get("usd_brl") or Ctx.fx_rate
+
+
+def _brl(usd, fx):
+    return None if usd is None or not fx else usd * fx
+
+
+def _with_brl(summary: dict, fx) -> dict:
+    """Acrescenta *_brl a um resumo de custo (que continua em USD): a UI nunca
+    deve multiplicar por cambio por conta propria. Sem cotacao, vem null."""
+    if not summary:
+        return summary
+    out = dict(summary)
+    for k in ("total_cost", "cost_per_hour"):
+        if k in out:
+            out[k + "_brl"] = _brl(out.get(k), fx)
+    if isinstance(out.get("by_model"), list):
+        out["by_model"] = [dict(m, cost_brl=_brl(m.get("cost"), fx)) for m in out["by_model"]]
+    if isinstance(out.get("by_source"), dict):
+        out["by_source"] = {s: dict(d, cost_brl=_brl(d.get("cost"), fx))
+                            for s, d in out["by_source"].items()}
+    return out
+
+
+def _claude_states(latest, hourly_profile) -> dict:
+    """Projecao + semaforo de TODAS as janelas do ultimo snapshot, inclusive
+    as por modelo (seven_day_model:*) e as sem dado (viram INDETERMINADO em
+    vez de sumir)."""
+    states = {}
+    for key, wd in ((latest or {}).get("windows") or {}).items():
+        hrs = usage_api.window_hours_for(key)
+        util = wd.get("utilization")
+        snap_rate = Ctx.store.snapshot_rate(key) if util is not None else None
+        st = forecast.smart_project_window(util, wd.get("resets_at"), hrs,
+                                           hourly_profile, snap_rate=snap_rate)
+        st["label"] = wd.get("label") or WINDOW_LABELS.get(key) or key
+        st["window"] = key
+        st["window_hours"] = hrs
+        states[key] = st
+    return states
+
+
+def _codex_short_name(limit) -> str:
+    if limit.get("id") == "codex":
+        return "Codex"
+    name = limit.get("name") or limit.get("id") or "Codex"
+    m = _CODEX_SHORT.match(name)
+    return m.group(1) if m else name
+
+
+def _hours_label(hours) -> str:
+    return "7 dias" if round(hours) == 168 else f"{int(round(hours))} horas"
+
+
+def _codex_states(cg) -> list:
+    """Um estado por (limite x primary/secondary) do Codex, com projecao e
+    semaforo pelo MESMO forecast das janelas do Claude. A taxa vem da serie
+    de limit_history (reset detectado por queda, porque com 0% o resets_at
+    do Codex e' rolante e muda a cada poll)."""
+    if not cg:
+        return []
+    profile = cg.get("hour_of_day") or []
+    history = cg.get("limit_history") or []
+    out = []
+    for limit in cg.get("limits") or []:
+        short = _codex_short_name(limit)
+        for wk in ("primary", "secondary"):
+            w = limit.get(wk)
+            if not w:
+                continue
+            hrs = ((w.get("window_minutes") or 0) / 60) or 168
+            series = []
+            for h in history:
+                for l in h.get("limits") or []:
+                    if l.get("id") != limit.get("id"):
+                        continue
+                    lw = l.get(wk)
+                    if lw and lw.get("used_percent") is not None:
+                        series.append((h.get("ts"), lw.get("used_percent")))
+            rate = forecast.series_rate(series)
+            st = forecast.smart_project_window(w.get("used_percent"), w.get("resets_at"),
+                                               hrs, profile, snap_rate=rate)
+            st.update({
+                "key": f"codex:{limit.get('id')}:{wk}",
+                "label": f"{short} · {_hours_label(hrs)}",
+                "product": limit.get("name"),
+                "window_hours": hrs,
+                "snapshot_ts": limit.get("snapshot_ts"),
+            })
+            out.append(st)
+    return out
+
+
+def _quota_item(provider, key, source_key, label, product, window_hours, st, snapshot_ts):
+    return {
+        "provider": provider,
+        "key": key,
+        "source_key": source_key,
+        "label": label,
+        "product": product,
+        "window_hours": window_hours,
+        "utilization": st.get("utilization"),
+        "resets_at": st.get("resets_at"),
+        "hours_to_reset": st.get("hours_to_reset"),
+        "projected": st.get("projected"),
+        "projected_linear": st.get("projected_linear"),
+        "status": st.get("status"),
+        "rate": st.get("rate"),
+        "eta_100": st.get("eta_100"),
+        "smart": st.get("smart"),
+        "snapshot_ts": snapshot_ts,
+    }
+
+
+def _claude_order(key):
+    # sessao, semana geral, janelas por modelo (alfabetico), demais legadas
+    if key == "five_hour":
+        return (0, key)
+    if key == "seven_day":
+        return (1, key)
+    if key.startswith(usage_api.MODEL_WINDOW_PREFIX):
+        return (2, key)
+    return (3, key)
+
+
+def _quotas(claude_states, codex_states, snapshot_ts) -> list:
+    """Contrato unico Claude + Codex: mesma forma para os dois provedores."""
+    items = []
+    for key in sorted(claude_states, key=_claude_order):
+        st = claude_states[key]
+        if key.startswith(usage_api.MODEL_WINDOW_PREFIX):
+            product = st.get("label")
+            label = f"{product} · 7 dias"
+        else:
+            product = None
+            label = QUOTA_LABELS.get(key) or st.get("label") or key
+        items.append(_quota_item("claude", f"claude:{key}", key, label, product,
+                                 st.get("window_hours"), st, snapshot_ts))
+    for st in codex_states:
+        items.append(_quota_item("codex", st["key"], st["key"].split(":", 1)[1],
+                                 st["label"], st.get("product"), st.get("window_hours"),
+                                 st, st.get("snapshot_ts")))
+    return items
+
+
 def build_state() -> dict:
     cfg = Ctx.cfg
+    fx = fx_rate()
     latest = Ctx.store.latest_state()
     hourly_profile = Ctx.store.hour_of_day_avg()
-    windows_out, states = {}, {}
-    if latest:
-        for win, hrs in WINDOW_HOURS.items():
-            wd = latest["windows"].get(win)
-            if not wd or wd.get("utilization") is None:
-                continue
-            snap_rate = Ctx.store.snapshot_rate(win)
-            st = forecast.smart_project_window(
-                wd["utilization"], wd["resets_at"], hrs,
-                hourly_profile, snap_rate=snap_rate)
-            st["label"] = WINDOW_LABELS[win]
-            st["window"] = win
-            windows_out[win] = st
-            states[win] = st
+    states = _claude_states(latest, hourly_profile)
+    # /api/state.windows continua com a forma antiga (so chaves classicas com
+    # valor numerico): e' o que Tauri e Stream Deck ja publicados esperam.
+    windows_out = {k: st for k, st in states.items()
+                   if k in LEGACY_WINDOW_KEYS and st.get("utilization") is not None}
+    chatgpt = Ctx.codex.state() if Ctx.codex else None
+    quotas = _quotas(states, _codex_states(chatgpt), latest["ts"] if latest else None)
 
     burn = Ctx.store.recent_tokph(2)
     dominant = max(burn, key=burn.get) if burn else None
-    verdict = (forecast.switch_verdict(states, dominant,
-                                       cfg.get("intended_hours", 2.0))
-               if states else None)
+    verdict = (forecast.switch_verdict(
+        states, dominant, cfg.get("intended_hours", 2.0),
+        target=cfg.get("switch_target"),
+        candidates={k for k in (forecast._model_key(m) for m in burn) if k})
+        if windows_out else None)
 
     extra = None
     if latest and latest.get("extra_usage"):
@@ -122,8 +275,15 @@ def build_state() -> dict:
         extra = {
             "used": (eu["used_credits"] / div) if eu.get("used_credits") is not None else None,
             "limit": (eu["monthly_limit"] / div) if eu.get("monthly_limit") is not None else None,
-            "currency": eu.get("currency") or cfg.get("currency"),
+            # Moeda dos creditos = a que a API informa (a conta pode ser
+            # cobrada em BRL ou USD). Sem informacao, assume USD — nunca a
+            # moeda de EXIBICAO do painel (cfg["currency"]), que foi o que
+            # fazia o painel somar dolar com real.
+            "currency": eu.get("currency") or "USD",
         }
+        to_brl = (lambda v: v) if extra["currency"] == "BRL" else (lambda v: _brl(v, fx))
+        extra["used_brl"] = to_brl(extra["used"])
+        extra["limit_brl"] = to_brl(extra["limit"])
         # licenca x extras: mede pelo historico de used_credits dos snapshots
         try:
             series = Ctx.store.extra_credit_series(24)
@@ -152,16 +312,12 @@ def build_state() -> dict:
                     burning = True
                     break
         extra.update({"rate_per_hour": rate, "spent_24h": spent_24h,
+                      "rate_per_hour_brl": to_brl(rate),
+                      "spent_24h_brl": to_brl(spent_24h),
                       "burning": burning})
 
-    history = {sc: Ctx.store.scope_summary(sc)
+    history = {sc: _with_brl(Ctx.store.scope_summary(sc), fx)
                for sc in ("geral", "mes", "semana", "dia")}
-
-    semrush = {
-        "balance": cfg.get("semrush_units_balance"),
-        "limit": cfg.get("semrush_units_limit"),
-        "updated_at": cfg.get("semrush_units_updated_at"),
-    }
 
     org = (Ctx.profile or {}).get("organization") or {}
     plan = {
@@ -179,19 +335,21 @@ def build_state() -> dict:
         "rate_limited": Ctx.rate_limited,
         "retry_in": max(0, int(Ctx.next_poll_at - time.time())) if Ctx.rate_limited else 0,
         "last_error": Ctx.last_error,
+        "last_error_detail": Ctx.last_error_detail,
         "windows": windows_out,
+        "quotas": quotas,
         "switch": verdict,
         "burn_tokph": {k: round(v) for k, v in burn.items()},
         "dominant_model": dominant,
         "extra_usage": extra,
         "history": history,
-        "chatgpt": Ctx.codex.state() if Ctx.codex else None,
+        "chatgpt": chatgpt,
         "plan": plan,
-        "semrush": semrush,
+        "update": updates.state(),
         "config": {"refresh_seconds": _poll_interval(),
                    "intended_hours": cfg.get("intended_hours"),
                    "currency": cfg.get("currency"),
-                   "usd_brl": cfg.get("usd_brl") or Ctx.fx_rate,
+                   "usd_brl": fx,
                    "subscription_brl": cfg.get("subscription_brl"),
                    "chatgpt_subscription_brl": cfg.get("chatgpt_subscription_brl"),
                    "chatgpt_extra_brl": cfg.get("chatgpt_extra_brl") if cfg.get("chatgpt_extra_month") == dt.datetime.now().strftime("%Y-%m") else None},
@@ -282,17 +440,26 @@ def poll_once(log=print):
     try:
         refresh_fx(log)
         refresh_profile(log)
+        updates.check(log=log)
         try:
             Ctx.store.scan(log=lambda *a: None)
         except Exception as e:
             log(f"[poll] scan falhou: {e}")
         try:
             raw = usage_api.fetch_usage(Ctx.token_store, log=log)
-            Ctx.store.insert_snapshot(usage_api.normalize(raw))
+            norm = usage_api.normalize(raw)
+            Ctx.store.insert_snapshot(norm)
+            if not Ctx.ignored_logged and (norm.get("ignored_keys") or norm.get("ignored_limits")):
+                # uma vez por boot: o que a API mandou e nao virou cota. Foi a
+                # falta disto que escondeu a janela por modelo por semanas.
+                log(f"[usage] chaves da API que nao viram cota: {norm.get('ignored_keys')}; "
+                    f"limits[] ignorados: {norm.get('ignored_limits')}")
+                Ctx.ignored_logged = True
             Ctx.auth_connected = True
             Ctx.rate_limited = False
             Ctx.rate_limit_hits = 0
             Ctx.last_error = None
+            Ctx.last_error_detail = None
             Ctx.last_poll = time.time()
             Ctx.boot_retries = 0
             Ctx.next_poll_at = time.time() + _poll_interval()
@@ -301,24 +468,28 @@ def poll_once(log=print):
             espera = _schedule_backoff(e.retry_after)
             Ctx.rate_limited = True
             Ctx.last_error = (
-                f"limite de requisicoes da conta; nova tentativa em {int(espera)}s")
+                f"Limite de requisições da conta; nova tentativa em {int(espera)}s.")
+            Ctx.last_error_detail = f"RateLimited: retry_after={e.retry_after}"
             log(f"[poll] 429 ({Ctx.rate_limit_hits}x), aguardando {int(espera)}s")
         except auth.TransientAuthError as e:
             espera = _schedule_backoff()
             Ctx.rate_limited = True
-            Ctx.last_error = f"renovacao adiada ({e}); nova tentativa em {int(espera)}s"
+            Ctx.last_error = f"Renovação do token adiada; nova tentativa em {int(espera)}s."
+            Ctx.last_error_detail = f"TransientAuthError: {e}"
             log(f"[poll] falha transitoria ao renovar: {e}")
         except auth.AuthError as e:
             Ctx.auth_connected = False
             Ctx.rate_limited = False
-            Ctx.last_error = f"auth: {e}"
+            Ctx.last_error = "Conta desconectada: é preciso reconectar."
+            Ctx.last_error_detail = f"AuthError: {e}"
             Ctx.next_poll_at = time.time() + _retry_after_falha()
             log(f"[poll] sem token valido: {e}")
         except Exception as e:
             # rede/servidor: nao mexe em auth_connected, so tenta mais tarde
-            Ctx.last_error = str(e)
-            Ctx.next_poll_at = time.time() + _retry_after_falha()
-            log(f"[poll] erro: {e}")
+            espera = _retry_after_falha()
+            Ctx.last_error, Ctx.last_error_detail = errors.humanize(e, retry_in=espera)
+            Ctx.next_poll_at = time.time() + espera
+            log(f"[poll] erro: {Ctx.last_error_detail}")
     finally:
         _poll_lock.release()
 
@@ -354,7 +525,9 @@ def start_login_thread():
                                 callback_port=Ctx.cfg.get("callback_port", 54545))
             poll_once()
         except Exception as e:
-            Ctx.last_error = f"login: {e}"
+            msg, detail = errors.humanize(e)
+            Ctx.last_error = f"Falha ao reconectar a conta: {msg}"
+            Ctx.last_error_detail = f"login: {detail}"
     Ctx._login_thread = threading.Thread(target=_run, daemon=True)
     Ctx._login_thread.start()
 
@@ -396,17 +569,23 @@ class Handler(BaseHTTPRequestHandler):
         p = self.path.split("?")[0]
         try:
             if p == "/api/health":
-                self._send(200, json.dumps({"app": "ai-usage", "protocol": 1}))
+                self._send(200, json.dumps({"app": "ai-usage", "protocol": 1,
+                                            "version": updates.current_version(),
+                                            "features": ["quotas", "brl", "label", "errors", "update"]}))
             elif p == "/api/state":
                 self._send(200, json.dumps(build_state(), ensure_ascii=False))
             elif p == "/api/total":
-                self._send(200, json.dumps(Ctx.store.total_summary(), ensure_ascii=False))
+                self._send(200, json.dumps(_with_brl(Ctx.store.total_summary(), fx_rate()),
+                                           ensure_ascii=False))
             elif p == "/api/history":
+                fx = fx_rate()
                 out = {
                     "snapshots": Ctx.store.snapshot_history(48),
-                    "daily": Ctx.store.daily_series(Ctx.cfg.get("daily_days", 30)),
+                    "daily": [dict(d, cost_brl=_brl(d.get("cost"), fx))
+                              for d in Ctx.store.daily_series(Ctx.cfg.get("daily_days", 30))],
                     "hour_of_day": Ctx.store.hour_of_day_avg(),
-                    "heatmap": Ctx.store.heatmap_data(),
+                    "heatmap": [dict(c, avg_cost_brl=_brl(c.get("avg_cost"), fx))
+                                for c in Ctx.store.heatmap_data()],
                 }
                 self._send(200, json.dumps(out, ensure_ascii=False))
             elif p == "/auth/start":
@@ -439,12 +618,6 @@ class Handler(BaseHTTPRequestHandler):
                 Ctx.cfg["chatgpt_extra_month"] = dt.datetime.now().strftime("%Y-%m")
             save_config(Ctx.cfg)
             self._send(200, json.dumps({"ok": True, "config": Ctx.cfg}))
-        elif p == "/api/semrush":
-            if "balance" in body and isinstance(body["balance"], (int, float)):
-                Ctx.cfg["semrush_units_balance"] = int(body["balance"])
-                Ctx.cfg["semrush_units_updated_at"] = dt.datetime.now(timezone.utc).isoformat()
-                save_config(Ctx.cfg)
-            self._send(200, json.dumps({"ok": True}))
         elif p == "/api/refresh":
             # respeita o backoff e um intervalo minimo: o botao Atualizar nao
             # pode virar um jeito de furar o rate limit da conta
@@ -478,8 +651,6 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 DEFAULTS = {"port": 8090, "refresh_seconds": 120, "currency": "BRL",
             "credits_divisor": 100, "intended_hours": 2.0, "daily_days": 30,
             "callback_port": 54545, "open_browser": True,
-            "semrush_units_balance": None, "semrush_units_limit": 49190,
-            "semrush_units_updated_at": None,
             "usd_brl": None,  # None = cotacao automatica (AwesomeAPI, cache 1h)
             "subscription_brl": None,  # valor mensal da licenca (R$), p/ balanço
             "chatgpt_subscription_brl": None,  # assinatura ChatGPT; comparacao por uso da cota

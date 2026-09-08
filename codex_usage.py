@@ -10,6 +10,7 @@ dessas sessoes no Codex continua sendo contado.
 import datetime as dt
 import glob
 import json
+import errors
 import os
 import threading
 import sqlite3
@@ -231,7 +232,12 @@ class CodexUsage:
                     db.execute("DELETE FROM codex_limits WHERE ts < ?", ((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=90)).isoformat(),))
         except (OSError, ValueError, urllib.error.URLError) as exc:
             with self._lock:
-                self._api_error = str(exc)
+                if isinstance(exc, ValueError) and not isinstance(exc, json.JSONDecodeError):
+                    # sessao do Codex ausente: a mensagem ja e' legivel
+                    self._api_error, self._api_error_detail = (
+                        "Sessão ChatGPT do Codex não encontrada nesta máquina.", f"ValueError: {exc}")
+                else:
+                    self._api_error, self._api_error_detail = errors.humanize(exc)
 
     @staticmethod
     def _scope_start(scope):
@@ -282,6 +288,20 @@ class CodexUsage:
                 m["equivalent_usd"] += cost
         out["by_model"] = sorted(by_model.values(), key=lambda m: m["tokens"], reverse=True)
         return out
+
+    @staticmethod
+    def _hour_of_day(events):
+        """Media de tokens por hora-do-dia (local) — perfil para a projecao
+        ponderada, no mesmo formato de store.hour_of_day_avg()."""
+        tokens, days = {}, {}
+        for event in events:
+            when = _parse_iso(event.get("timestamp"))
+            if not when:
+                continue
+            local = when.astimezone()
+            tokens[local.hour] = tokens.get(local.hour, 0) + event["total_tokens"]
+            days.setdefault(local.hour, set()).add(local.date())
+        return [{"hour": h, "avg_tokens": tokens[h] / len(days[h])} for h in sorted(tokens)]
 
     @staticmethod
     def _daily_series(events, days=30):
@@ -396,6 +416,7 @@ class CodexUsage:
                 "burn_by_model": {m["model"]: m["tokens"] / 2 for m in recent["by_model"]},
                 "pricing": {"verified_at": "2026-09-05", "basis": "standard text API; no tool fees or Fast premium", "models": API_PRICES},
                 "limit_history": self.limit_history(),
+                "hour_of_day": self._hour_of_day(events),
                 "daily": self._daily_series(events),
                 "heatmap": self._heatmap(events),
                 "native_sessions": len(native_sessions),
@@ -404,4 +425,5 @@ class CodexUsage:
                 "limits_source": "chatgpt" if self._direct_limits is not None else "logs",
                 "limits_refresh_seconds": LIMIT_REFRESH_SECONDS,
                 "limits_error": self._api_error,
+                "limits_error_detail": getattr(self, "_api_error_detail", None),
             }
