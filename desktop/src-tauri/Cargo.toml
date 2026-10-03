@@ -2,9 +2,9 @@
 name = "claude-usage-desktop"
 version = "4.2.0"
 description = "Painel de consumo Claude e Codex com backend integrado"
-authors = ["Eduardo Campos"]
+authors = ["Astronauta Martech"]
 license = "MIT"
-repository = "https://github.com/eueduardocampos/claude-usage"
+repository = "https://github.com/astronauta-martech/ai-usage"
 edition = "2021"
 rust-version = "1.77.2"
 
